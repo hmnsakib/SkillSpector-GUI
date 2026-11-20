@@ -10,6 +10,8 @@ import subprocess
 import sys
 import tempfile
 
+import ss_groups
+
 REPO = "git+https://github.com/NVIDIA/skillspector.git"
 UV_WIN_INSTALL = "irm https://astral.sh/uv/install.ps1 | iex"
 UV_UNIX_INSTALL = "curl -LsSf https://astral.sh/uv/install.sh | sh"
@@ -269,7 +271,7 @@ def run_scan(skillspector, target, quick, api_provider, api_key, on_line, holder
             result["error"] = "Cancelled."
             return result
         if os.path.isfile(out_path):
-            with open(out_path, "r", encoding="utf-8", errors="replace") as f:
+            with open(out_path, "r", encoding="utf-8-sig", errors="replace") as f:
                 result["raw_text"] = f.read()
             result["report"] = _load_json_text(result["raw_text"])
             result["ok"] = result["report"] is not None
@@ -302,9 +304,15 @@ def _pick(d, keys):
     return None
 
 
+SEVERITIES = ("Critical", "High", "Medium", "Low")
+
+
 def norm_severity(v):
+    """Keep SkillSpector's four levels: Critical, High, Medium, Low (unknown -> Low)."""
     s = str(v or "").strip().lower()
-    if s in ("critical", "high", "severe", "error"):
+    if s == "critical":
+        return "Critical"
+    if s in ("high", "severe", "error"):
         return "High"
     if s in ("medium", "moderate", "warning", "warn"):
         return "Medium"
@@ -344,11 +352,20 @@ def _find_list(obj, depth=0):
     return None
 
 
-def _issue_location(issue):
+def _issue_file_line(issue):
     loc = issue.get("location")
-    if not isinstance(loc, dict) or not loc.get("file"):
+    if not isinstance(loc, dict):
+        return "", None
+    f = loc.get("file")
+    line = loc.get("start_line")
+    return (str(f) if f else ""), (line if isinstance(line, int) else None)
+
+
+def _issue_location(issue):
+    f, line = _issue_file_line(issue)
+    if not f:
         return ""
-    return "%s · line %s" % (loc["file"], loc["start_line"]) if loc.get("start_line") else str(loc["file"])
+    return "%s · line %s" % (f, line) if line else f
 
 
 def _parse_real_issues(report):
@@ -363,98 +380,238 @@ def _parse_real_issues(report):
         title = str(it.get("pattern") or it.get("category") or "Finding")
         if it.get("category") and it.get("pattern"):
             title = "%s: %s" % (it["category"], it["pattern"])
+        f, line = _issue_file_line(it)
         out.append({
             "severity": norm_severity(it.get("severity")),
             "title": title,
             "description": desc,
             "where": _issue_location(it),
+            "file": f,
+            "line": line,
         })
     return out
 
 
-def risk_summary(report):
-    """Return (recommendation, score) from risk_assessment, or (None, None)."""
-    ra = report.get("risk_assessment") if isinstance(report, dict) else None
-    if not isinstance(ra, dict):
-        return None, None
-    return ra.get("recommendation"), ra.get("score")
+def _generic_finding(it):
+    f = _pick(it, FILE_KEYS)
+    loc = it.get("location")
+    if isinstance(loc, dict):
+        f = f or _pick(loc, FILE_KEYS)
+    elif isinstance(loc, str) and not f:
+        f = loc
+    return {
+        "severity": norm_severity(_pick(it, SEV_KEYS)),
+        "title": str(_pick(it, TITLE_KEYS) or "Finding"),
+        "description": str(_pick(it, DESC_KEYS) or ""),
+        "where": _location(it),
+        "file": str(f) if f else "",
+        "line": None,
+    }
 
 
-def incomplete_note(report):
-    """Return a warning string if the scan only partly covered the skill, else ''."""
-    ac = report.get("analysis_completeness") if isinstance(report, dict) else None
-    if isinstance(ac, dict) and ac.get("is_complete") is False:
-        return "Coverage was %s%%: some files or checks were not fully inspected." % ac.get("coverage_percent", "?")
-    return ""
+def sort_findings(findings):
+    order = {s: i for i, s in enumerate(SEVERITIES)}
+    return sorted(findings, key=lambda f: order.get(f["severity"], 99))
 
 
 def parse_findings(report):
-    """Return a list of finding dicts, or None if the report format wasn't recognised."""
-    out = None
+    """Return a list of finding dicts (worst first), or None if the report format wasn't recognised."""
     if isinstance(report, dict) and isinstance(report.get("issues"), list):
-        out = _parse_real_issues(report)
-        order = {"High": 0, "Medium": 1, "Low": 2}
-        out.sort(key=lambda f: order[f["severity"]])
-        return out
+        return sort_findings(_parse_real_issues(report))
     items = _find_list(report)
     if items is None:
         return None
-    out = []
-    for it in items:
-        out.append({
-            "severity": norm_severity(_pick(it, SEV_KEYS)),
-            "title": str(_pick(it, TITLE_KEYS) or "Finding"),
-            "description": str(_pick(it, DESC_KEYS) or ""),
-            "where": _location(it),
-        })
-    order = {"High": 0, "Medium": 1, "Low": 2}
-    out.sort(key=lambda f: order[f["severity"]])
-    return out
+    return sort_findings([_generic_finding(it) for it in items if isinstance(it, dict)])
 
 
 def count_by_severity(findings):
-    c = {"High": 0, "Medium": 0, "Low": 0}
+    c = {s: 0 for s in SEVERITIES}
     for f in findings:
-        c[f["severity"]] += 1
+        c[f["severity"]] = c.get(f["severity"], 0) + 1
     return c
 
 
-RECOMMENDATIONS = {
-    "DO_NOT_INSTALL": ("Do not install", "SkillSpector rates this skill as dangerous. Review the findings below.", "bad"),
-    "CAUTION": ("Review before installing", "Some risky patterns were found. Read them below.", "warn"),
-    "SAFE": ("No serious issues found", "A clean result is not proof the skill is safe.", "ok"),
-}
+# ---------------------------------------------------------------- score, completeness, groups
+
+def risk_summary(report):
+    """Return (recommendation, score, severity) exactly as SkillSpector reported, or Nones."""
+    ra = report.get("risk_assessment") if isinstance(report, dict) else None
+    if not isinstance(ra, dict):
+        return None, None, None
+    return ra.get("recommendation"), ra.get("score"), ra.get("severity")
 
 
-def verdict(counts, recommendation=None):
-    """(label, explanation, level) where level is 'bad' | 'warn' | 'ok'.
+def completeness(report):
+    """Return a dict describing how thoroughly the scan inspected the skill, or None if unknown.
 
-    If SkillSpector's own recommendation is known it wins over our counting.
+    Keys: status, coverage, partial (bool), degraded[], disabled[], exclusions (int), llm_on (bool or None)
     """
-    if recommendation in RECOMMENDATIONS:
-        return RECOMMENDATIONS[recommendation]
-    if counts["High"]:
-        n = counts["High"]
-        return ("Do not install",
-                "%d serious problem%s found. Review them below." % (n, "" if n == 1 else "s"), "bad")
-    if counts["Medium"]:
-        return ("Review before installing", "Some risky patterns were found. Read them below.", "warn")
-    if counts["Low"]:
-        return ("Minor issues only", "Only low-risk items were found.", "ok")
-    return ("No issues found", "A clean result is not proof the skill is safe.", "ok")
+    if not isinstance(report, dict):
+        return None
+    ac = report.get("analysis_completeness")
+    meta = report.get("metadata") if isinstance(report.get("metadata"), dict) else {}
+    if not isinstance(ac, dict):
+        ac = {}
+    analyzers = [a for a in (ac.get("analyzer_statuses") or []) if isinstance(a, dict)]
+
+    def ids(status):
+        return [str(a.get("analyzer_id", "?")) for a in analyzers if a.get("status") == status]
+    llm = meta.get("llm_available")
+    if not ac and not isinstance(llm, bool):
+        return None
+    excl = ac.get("scope_exclusions")
+    return {
+        "status": ac.get("status"),
+        "coverage": ac.get("coverage_percent"),
+        "partial": ac.get("is_complete") is False or ac.get("status") not in (None, "complete"),
+        "degraded": ids("degraded"),
+        "disabled": ids("disabled"),
+        "exclusions": len(excl) if isinstance(excl, list) else 0,
+        "llm_on": llm if isinstance(llm, bool) else None,
+    }
 
 
-def to_markdown(target, findings, counts, recommendation=None):
-    lab, expl, _ = verdict(counts, recommendation)
-    lines = ["# SkillSpector report", "", "Scanned: %s" % target, "",
-             "**%s** - %s" % (lab, expl), "",
-             "High: %d | Medium: %d | Low: %d" % (counts["High"], counts["Medium"], counts["Low"]), ""]
+def completeness_lines(info):
+    """(warning, details) text for the results page. Empty strings when there is nothing to say."""
+    if not info:
+        return "", ""
+    warn = ""
+    if info["partial"]:
+        warn = "Partial scan"
+        if info["coverage"] is not None:
+            warn += ", coverage %s%%" % info["coverage"]
+    bits = []
+    if info["llm_on"] is False:
+        bits.append("AI (LLM) analysis was off")
+    if info["degraded"]:
+        bits.append("limited checks: " + ", ".join(info["degraded"]))
+    if info["exclusions"]:
+        bits.append("%d path%s outside the scan scope" % (info["exclusions"], "" if info["exclusions"] == 1 else "s"))
+    return warn, ("; ".join(bits) + "." if bits else "")
+
+
+def group_findings(findings):
+    """Group findings by file path using ss_groups. Returns a list (table order, empty groups included):
+    {"name", "findings" (worst first), "counts" (per severity), "total"}"""
+    buckets = {g[0]: [] for g in ss_groups.ALL_GROUPS}
     for f in findings:
-        lines.append("## [%s] %s" % (f["severity"], f["title"]))
-        if f["description"]:
-            lines.append(f["description"])
-        if f["where"]:
-            lines.append("`%s`" % f["where"])
-        lines.append("")
+        buckets[ss_groups.group_for(f.get("file"))].append(f)
+    out = []
+    for g in ss_groups.ALL_GROUPS:
+        items = sort_findings(buckets[g[0]])
+        out.append({"name": g[0], "findings": items, "counts": count_by_severity(items), "total": len(items)})
+    return out
+
+
+def group_note(groups):
+    """Plain sentence built only from the group counts, e.g. 'Most findings are in tests and benchmarks.'"""
+    total = sum(g["total"] for g in groups)
+    if not total:
+        return ""
+    top = max(groups, key=lambda g: g["total"])
+    if top["total"] * 2 > total:
+        return "Most findings (%d of %d) are in %s." % (top["total"], total, ss_groups.short_name(top["name"]))
+    return "Findings are spread across several parts of the project."
+
+
+def group_summary(g):
+    """'3 issues (1 Critical, 2 High)' text for a group header."""
+    n = g["total"]
+    txt = "%d issue%s" % (n, "" if n == 1 else "s")
+    parts = ["%d %s" % (g["counts"][s], s) for s in SEVERITIES if g["counts"].get(s)]
+    return txt + (" (" + ", ".join(parts) + ")" if parts else "")
+
+
+# ---------------------------------------------------------------- open files
+
+def local_scan_root(kind, target):
+    """Folder that finding paths are relative to, or None when there is no local copy
+    (zip files and Git links are not extracted/cloned where we can see them)."""
+    t = (target or "").strip()
+    if kind == "folder" and os.path.isdir(t):
+        return t
+    if kind == "file" and os.path.isfile(t):
+        return os.path.dirname(t)
+    return None
+
+
+def resolve_local_file(root, rel):
+    """Absolute path of a finding's file if it exists inside root, else None (never escapes root)."""
+    if not root or not rel:
+        return None
+    try:
+        base = os.path.realpath(root)
+        full = os.path.realpath(os.path.join(base, rel.replace("/", os.sep)))
+        if os.path.commonpath([base, full]) != base:
+            return None
+    except (ValueError, OSError):
+        return None
+    return full if os.path.isfile(full) else None
+
+
+def open_in_default_app(path):
+    """Open a file with the system default program. Returns an error string or None."""
+    try:
+        if IS_WIN:
+            os.startfile(path)  # opens with the user's default program
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except OSError as e:
+        return str(e)
+    return None
+
+
+def skills_subfolder(target):
+    """Path of <target>/skills if the chosen folder has one, else None."""
+    t = (target or "").strip()
+    p = os.path.join(t, "skills")
+    return p if t and os.path.isdir(t) and os.path.isdir(p) else None
+
+
+# ---------------------------------------------------------------- verdict and export
+
+LEVEL_BY_RECOMMENDATION = {"DO_NOT_INSTALL": "bad", "CAUTION": "warn", "SAFE": "ok"}
+
+
+def verdict(counts, report=None):
+    """(title, subtitle, level) for the results banner.
+
+    With a SkillSpector risk_assessment the recommendation and score are shown EXACTLY as
+    reported (we add no label of our own). Without one we only say the scan finished.
+    """
+    rec, score, sev = risk_summary(report) if report is not None else (None, None, None)
+    total = sum(counts.values())
+    if rec:
+        sub = "Risk score: %s" % score if score is not None else ""
+        if sev:
+            sub += " (%s)" % sev
+        return str(rec), sub.strip(), LEVEL_BY_RECOMMENDATION.get(str(rec), "warn")
+    level = "bad" if counts.get("Critical") or counts.get("High") else ("warn" if total else "ok")
+    return ("Scan finished",
+            "SkillSpector did not report a recommendation. %d finding%s." % (total, "" if total == 1 else "s"),
+            level)
+
+
+def to_markdown(target, findings, counts, report=None):
+    lab, expl, _ = verdict(counts, report)
+    lines = ["# SkillSpector report", "", "Scanned: %s" % target, "",
+             "**Recommendation: %s** %s" % (lab, expl), "",
+             " | ".join("%s: %d" % (s, counts.get(s, 0)) for s in SEVERITIES), ""]
+    warn, details = completeness_lines(completeness(report))
+    if warn or details:
+        lines += ["_%s. %s_" % (warn, details) if warn else "_%s_" % details, ""]
+    for g in group_findings(findings):
+        if not g["total"]:
+            continue
+        lines += ["## %s - %s" % (g["name"], group_summary(g)), ""]
+        for f in g["findings"]:
+            lines.append("### [%s] %s" % (f["severity"], f["title"]))
+            if f["description"]:
+                lines.append(f["description"])
+            if f["where"]:
+                lines.append("`%s`" % f["where"])
+            lines.append("")
     lines.append("_A clean result is not proof a skill is safe._")
     return "\n".join(lines)
