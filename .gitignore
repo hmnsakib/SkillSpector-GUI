@@ -1,0 +1,31 @@
+# Build output (never commit binaries)
+build/
+dist/
+*.exe
+*.app/
+*.zip
+*.tar.gz
+*.spec.bak
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets / local config
+.env
+.env.*
+*.key
+.claude/settings.local.json
+
+# Local scan reports
+skillspector-report.*
